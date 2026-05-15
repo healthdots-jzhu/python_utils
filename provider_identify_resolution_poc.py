@@ -1,4 +1,27 @@
 """
+Normalize and enrich raw provider registry data into standardized comparison-ready fields.
+Performs the following transformations on each row:
+- Resolves provider name from explicit (first/last) fields or free-text (name/clinic_name)
+- Parses primary location from structured fields or one-line address string
+- Normalizes names to lowercase alphanumeric (first_n, last_n, full_n, clinic_name_n)
+- Normalizes license to uppercase alphanumeric (license_n)
+- Normalizes postal code to compact uppercase form; extracts FSA prefix (postal_n, postal_fsa)
+- Converts DOB string to datetime for year/month/day comparisons
+- Computes phonetic encodings: Soundex and Metaphone of last name for blocking
+- Normalizes primary practice location (street, city, province, postal, phone)
+- Validates primary address via external service (Canada Post API if configured)
+- Normalizes all secondary practice sites; combines with primary into location_sites_n
+Args:
+    df: Raw provider registry DataFrame with heterogeneous field names and formats
+        (may include: first, last, name, clinic_name, street1, street2, address, 
+        city, province, postal, phone, dob, license, specialty, other_practice_sites)
+Returns:
+    Enriched DataFrame with original columns plus normalized derivatives ready for
+    blocking, feature engineering, and ML matching (first_n, last_n, full_n, 
+    license_n, postal_n, postal_fsa, soundex, metaphone, primary_location_n, 
+    other_practice_sites_n, location_sites_n, etc.)
+Side effects:
+    None (operates on a copy of df).
 Canadian Healthcare Provider Identity Resolution
 =================================================
 Fuzzy matching + ML classifier pipeline for deduplicating provider records
@@ -8,17 +31,20 @@ Dependencies:
     pip install pandas scikit-learn jellyfish rapidfuzz recordlinkage xgboost
 """
 
+import logging
 import os  # Environment variables for optional external address validation.
 import re  # Regular expressions for normalizing licenses and postal codes.
+import sys
 import jellyfish  # Phonetic and string similarity helpers for name matching.
 import recordlinkage  # Blocking and candidate-pair generation for record linkage.
 import pandas as pd  # DataFrame operations for registry data and feature tables.
 import numpy as np  # Numeric utilities and NaN handling for labels and arrays.
 from rapidfuzz import fuzz  # Fast fuzzy string similarity scores for names and specialties.
 from sklearn.preprocessing import StandardScaler  # Feature scaling before training the classifier.
-from sklearn.model_selection import train_test_split  # Train/test splitting for production evaluation.
 from sklearn.metrics import classification_report  # Precision/recall summary for match quality.
 from xgboost import XGBClassifier  # Gradient-boosted classifier for match probability prediction.
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
@@ -103,9 +129,18 @@ def postal_fsa(postal: str) -> str:
     """Return the FSA (first 3 chars) from a normalized postal code."""
     return postal[:3] if postal else ""
 
-NAME_TITLES = {"DR", "DOCTOR", "MR", "MRS", "MS", "MISS", "PROF"}
-NAME_SUFFIXES = {"MD", "PHD", "DO", "DDS", "DMD", "MBBS", "FRCSC", "FRCPC", "NP", "RN", "BSC", "MSC"}
-CLINIC_HINTS = {"clinic", "centre", "center", "medical", "medicine", "practice", "health", "care", "hospital"}
+NAME_TITLES = {"DR", "DOCTOR", "MR", "MRS", "MS", "MISS", "PROF", "MME", "MLLE"}
+NAME_SUFFIXES = {"MD", "PHD", "DO", "DDS", "DMD", "MBBS", "FRCSC", "FRCPC", "NP", "RN", "BSC", "MSC", "INF", "IPS", "IPSC", "CSPQ"}
+CLINIC_HINTS = {"clinic", "centre", "center", "medical", "medicine", "practice", "health", "care", "hospital", "clinique", "soins", "cabinet"}
+
+_TITLE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in sorted(NAME_TITLES, key=len, reverse=True)) + r")\.?\b",
+    re.IGNORECASE,
+)
+_SUFFIX_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(s) for s in sorted(NAME_SUFFIXES, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
 
 def looks_like_person_name(text: str) -> bool:
     """Heuristic to tell whether a free-text field is likely a person name."""
@@ -125,8 +160,8 @@ def split_provider_name(raw_name: str, clinic_name: str = "") -> dict[str, str]:
             candidate = clinic_name.strip()
 
     candidate = candidate.split(",")[0]
-    candidate = re.sub(r"\b(?:DR|DOCTOR|MR|MRS|MS|MISS|PROF)\.?\b", " ", candidate, flags=re.IGNORECASE)
-    candidate = re.sub(r"\b(?:MD|PHD|DO|DDS|DMD|MBBS|FRCSC|FRCPC|NP|RN|BSC|MSC)\b", " ", candidate, flags=re.IGNORECASE)
+    candidate = _TITLE_RE.sub(" ", candidate)
+    candidate = _SUFFIX_RE.sub(" ", candidate)
     candidate = re.sub(r"[^A-Za-z0-9\s\-']", " ", candidate)
     candidate = re.sub(r"\s+", " ", candidate).strip()
     tokens = candidate.split()
@@ -449,11 +484,13 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["metaphone"] = df["last_n"].apply(lambda x: jellyfish.metaphone(x) if x else "")
     df["primary_location_n"] = df.apply(
         lambda row: normalize_location(
-            build_primary_location(row),
-            row.get("city", ""),
-            row.get("province", ""),
-            row.get("postal", ""),
-            row.get("phone", ""),
+            {"street1": row["street1"], "street2": row["street2"],
+             "city": row["city"], "province": row["province"],
+             "postal": row["postal"], "phone": row["phone"]},
+            row["city"],
+            row["province"],
+            row["postal"],
+            row["phone"],
         ),
         axis=1,
     )
@@ -474,10 +511,6 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
     return df
-
-reg_a = preprocess(registry_a)
-reg_b = preprocess(registry_b)
-reg_c = preprocess(registry_c)
 
 
 # ─────────────────────────────────────────────
@@ -581,34 +614,35 @@ def build_features(pairs, a: pd.DataFrame, b: pd.DataFrame, pair_name: str) -> p
             "site_street_sim":      location_features["site_street_sim"],
             "site_unit_match":      location_features["site_unit_match"],
             "site_unit_conflict":    location_features["site_unit_conflict"],
-            "site_province_match":   location_features["site_province_match"],
-            "postal_exact_match":    location_features["site_postal_exact_match"],
-            "postal_fsa_match":      location_features["site_postal_fsa_match"],
-            "postal_sim":            location_features["site_postal_sim"],
-            "site_city_sim":         location_features["site_city_sim"],
-            "phone_exact_match":      phone_exact_match,
-            "phone_last7_match":      phone_last7_match,
-            "phone_sim":              phone_sim,
-            "city_sim":               city_sim,
+            "site_province_match":      location_features["site_province_match"],
+            "site_postal_exact_match":  location_features["site_postal_exact_match"],
+            "site_postal_fsa_match":    location_features["site_postal_fsa_match"],
+            "site_postal_sim":          location_features["site_postal_sim"],
+            "site_city_sim":            location_features["site_city_sim"],
+            "site_phone_exact_match":   location_features["site_phone_exact_match"],
+            "site_phone_last7_match":   location_features["site_phone_last7_match"],
+            "site_phone_sim":           location_features["site_phone_sim"],
+            "phone_exact_match":        phone_exact_match,
+            "phone_last7_match":        phone_last7_match,
+            "phone_sim":               phone_sim,
+            "city_sim":                city_sim,
         })
 
     return pd.DataFrame(rows)
 
-PAIR_CONFIGS = [
-    ("A-B", reg_a, reg_b),
-    ("A-C", reg_a, reg_c),
-    ("B-C", reg_b, reg_c),
+FEATURE_COLS = [
+    "jw_first","jw_last","jw_full","clinic_name_sim","fuzz_full",
+    "soundex_match","metaphone_match",
+    "dob_exact","dob_year","dob_month",
+    "lic_exact","lic_fuzzy",
+    "spec_sim",
+    "site_address_full_sim","site_address_base_sim","site_street_sim",
+    "site_unit_match","site_unit_conflict","site_province_match",
+    "site_postal_exact_match","site_postal_fsa_match","site_postal_sim","site_city_sim",
+    "site_phone_exact_match","site_phone_last7_match","site_phone_sim",
+    "phone_exact_match","phone_last7_match","phone_sim",
+    "city_sim",
 ]
-
-feature_frames = []
-for pair_name, left_df, right_df in PAIR_CONFIGS:
-    pairs = generate_candidate_pairs(left_df, right_df)
-    feature_frames.append(build_features(pairs, left_df, right_df, pair_name))
-    print(f"{pair_name}: total pairs={len(left_df) * len(right_df)}  candidates={len(pairs)}")
-
-feature_df = pd.concat(feature_frames, ignore_index=True)
-print("\nFeature matrix (candidate pairs × features):")
-print(feature_df.drop(columns=["idx_a","idx_b"]).round(2).to_string(), "\n")
 
 
 # ─────────────────────────────────────────────
@@ -643,29 +677,6 @@ def lookup_label(id_a: str, id_b: str) -> float:
         return ground_truth_by_id[(id_b, id_a)]
     return np.nan
 
-# Attach labels to feature rows
-feature_df["label"] = feature_df.apply(
-    lambda r: lookup_label(r["id_a"], r["id_b"]), axis=1
-)
-labelled = feature_df.dropna(subset=["label"])
-print(f"Labelled pairs: {len(labelled)}  (matches: {int(labelled['label'].sum())})\n")
-
-FEATURE_COLS = [
-    "jw_first","jw_last","jw_full","clinic_name_sim","fuzz_full",
-    "soundex_match","metaphone_match",
-    "dob_exact","dob_year","dob_month",
-    "lic_exact","lic_fuzzy",
-    "spec_sim",
-    "site_address_full_sim","site_address_base_sim","site_street_sim",
-    "site_unit_match","site_unit_conflict","site_province_match",
-    "postal_exact_match","postal_fsa_match","postal_sim","site_city_sim",
-    "phone_exact_match","phone_last7_match","phone_sim",
-    "city_sim",
-]
-
-X = labelled[FEATURE_COLS].values
-y = labelled["label"].astype(int).values
-
 
 # ─────────────────────────────────────────────
 # 6. RULE-BASED BASELINE (deterministic fast-path)
@@ -694,38 +705,6 @@ def rule_based_decision(row: pd.Series) -> str:
         return "NON-MATCH"
     return "AMBIGUOUS"
 
-feature_df["rule_decision"] = feature_df[FEATURE_COLS].apply(rule_based_decision, axis=1)
-
-
-# ─────────────────────────────────────────────
-# 7. ML CLASSIFIER  (XGBoost — handles missing features, non-linear interactions)
-#    Trained on steward-labelled pairs; predicts match probability for ambiguous cases.
-# ─────────────────────────────────────────────
-
-# With only 4 labelled pairs we skip train/test split (demo only).
-# In production: hundreds/thousands of labelled pairs → proper split + cross-val.
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-clf = XGBClassifier(
-    n_estimators=100,
-    max_depth=3,
-    learning_rate=0.1,
-    eval_metric="logloss",
-    random_state=42,
-)
-clf.fit(X_scaled, y)
-
-
-# ─────────────────────────────────────────────
-# 8. PREDICT ON ALL CANDIDATE PAIRS  (rule-based → ML fallback)
-# ─────────────────────────────────────────────
-
-X_all        = feature_df[FEATURE_COLS].values
-X_all_scaled = scaler.transform(X_all)
-proba        = clf.predict_proba(X_all_scaled)[:, 1]    # P(match)
-
 MATCH_THRESHOLD     = 0.75   # auto-merge
 REVIEW_THRESHOLD    = 0.40   # human review queue
 
@@ -741,44 +720,6 @@ def final_decision(rule: str, prob: float) -> str:
         return f"HUMAN REVIEW     (p={prob:.2f})"
     return f"AUTO-REJECT (ML  p={prob:.2f})"
 
-feature_df["ml_prob"]  = proba
-feature_df["decision"] = feature_df.apply(
-    lambda r: final_decision(r["rule_decision"], r["ml_prob"]), axis=1
-)
-
-
-# ─────────────────────────────────────────────
-# 9. RESULTS
-# ─────────────────────────────────────────────
-
-print("=" * 72)
-print("IDENTITY RESOLUTION RESULTS")
-print("=" * 72)
-
-records_by_id = pd.concat([reg_a, reg_b, reg_c], ignore_index=True).set_index("id", drop=False)
-
-for _, row in feature_df.iterrows():
-    a = records_by_id.loc[row["id_a"]]
-    b = records_by_id.loc[row["id_b"]]
-    print(f"\n  {a['id']}  '{a['first']} {a['last']}'")
-    print(f"  {b['id']}  '{b['first']} {b['last']}'")
-    print(f"  Pair set: {row['pair_name']}")
-    print(f"  License match: {bool(row['lic_exact'])}  |  DOB exact: {bool(row['dob_exact'])}"
-          f"  |  Name JW: {row['jw_full']:.2f}")
-    print(f"  → {row['decision']}")
-
-
-# ─────────────────────────────────────────────
-# 10. FEATURE IMPORTANCE  (which signals matter most)
-# ─────────────────────────────────────────────
-
-print("\n\nFEATURE IMPORTANCE (XGBoost gain)")
-print("-" * 40)
-importances = pd.Series(clf.feature_importances_, index=FEATURE_COLS)
-for feat, score in importances.sort_values(ascending=False).items():
-    bar = "█" * int(score * 40)
-    print(f"  {feat:<20} {bar}  {score:.3f}")
-
 
 # ─────────────────────────────────────────────
 # 11. GOLDEN RECORD BUILDER  (merge confirmed matches)
@@ -791,11 +732,11 @@ SOURCE_TRUST = {
     "REGC": 0.80,
 }
 
-def merge_other_practice_sites(primary: pd.Series, secondary: pd.Series) -> list[dict[str, str]]:
-    """Union additional practice sites from both records."""
+def merge_other_practice_sites(rows: list[pd.Series]) -> list[dict[str, str]]:
+    """Union additional practice sites across all rows in a cluster."""
     merged_sites = []
     seen = set()
-    for source_row in (primary, secondary):
+    for source_row in rows:
         for site in source_row["other_practice_sites_n"]:
             key = (site["street_core"], site["unit"], site["city"], site["province"], site["postal"])
             if key in seen:
@@ -811,6 +752,79 @@ def merge_other_practice_sites(primary: pd.Series, secondary: pd.Series) -> list
             })
     return merged_sites
 
+def source_trust(record_id: str) -> float:
+    prefix = next((p for p in SOURCE_TRUST if record_id.startswith(p + "-")), None)
+    return SOURCE_TRUST.get(prefix, 0.7)
+
+def build_match_clusters(match_df: pd.DataFrame) -> list[list[str]]:
+    """Build connected components from pairwise AUTO-MATCH edges."""
+    adjacency: dict[str, set[str]] = {}
+    for _, row in match_df.iterrows():
+        a = row["id_a"]
+        b = row["id_b"]
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
+
+    visited = set()
+    clusters = []
+
+    for node in adjacency:
+        if node in visited:
+            continue
+        stack = [node]
+        component = []
+        visited.add(node)
+        while stack:
+            cur = stack.pop()
+            component.append(cur)
+            for nxt in adjacency.get(cur, set()):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+        clusters.append(sorted(component))
+
+    return sorted(clusters, key=lambda c: c[0])
+
+def _score_to_level(score: float) -> str:
+    """Map a numeric confidence score to a human-readable level label."""
+    if score >= 0.90:
+        return "HIGH"
+    if score >= 0.75:
+        return "MEDIUM"
+    return "LOW"
+
+def compute_cluster_confidence(cluster_ids: list[str], match_df: pd.DataFrame) -> dict[str, float | int | str]:
+    """Compute a cluster confidence score from supporting match edges."""
+    id_set = set(cluster_ids)
+    cluster_edges = match_df[
+        match_df.apply(lambda r: r["id_a"] in id_set and r["id_b"] in id_set, axis=1)
+    ]
+
+    possible_edges = len(cluster_ids) * (len(cluster_ids) - 1) // 2
+    if cluster_edges.empty or possible_edges == 0:
+        return {
+            "score": 0.0,
+            "level": "LOW",
+            "supporting_edges": 0,
+            "possible_edges": possible_edges,
+        }
+
+    def edge_strength(row: pd.Series) -> float:
+        if row["rule_decision"] == "MATCH":
+            return 1.0
+        return float(row["ml_prob"])
+
+    mean_edge_strength = float(cluster_edges.apply(edge_strength, axis=1).mean())
+    edge_coverage = len(cluster_edges) / possible_edges
+    score = 0.8 * mean_edge_strength + 0.2 * edge_coverage
+
+    return {
+        "score": score,
+        "level": _score_to_level(score),
+        "supporting_edges": len(cluster_edges),
+        "possible_edges": possible_edges,
+    }
+
 def format_address(address: dict[str, str]) -> str:
     """Render a normalized address dict into a compact human-readable string."""
     parts = [address.get("street1", "")]
@@ -823,17 +837,22 @@ def format_address(address: dict[str, str]) -> str:
         parts.append(address["postal"])
     return ", ".join(part for part in parts if part)
 
-def build_golden_record(a: pd.Series, b: pd.Series) -> dict:
+def build_golden_record(rows: list[pd.Series], cluster_ids: list[str], match_df: pd.DataFrame) -> dict:
     """
-    Merge two confirmed provider records.
-    For each field, pick the value from the most-trusted source.
-    Where they agree, flag as high-confidence.
+    Merge a connected cluster of confirmed provider records.
+    Pick primary fields from the highest-trust source and merge secondary sites.
     """
-    src_a = a["id"].split("-")[0]
-    src_b = b["id"].split("-")[0]
-    trust_a = SOURCE_TRUST.get(src_a, 0.7)
-    trust_b = SOURCE_TRUST.get(src_b, 0.7)
-    primary, secondary = (a, b) if trust_a >= trust_b else (b, a)
+    ranked_rows = sorted(rows, key=lambda r: source_trust(r["id"]), reverse=True)
+    primary = ranked_rows[0]
+    unique_last_names = {row["last_n"] for row in ranked_rows if row["last_n"]}
+    first_clinic = next((row.get("clinic_name", "") for row in ranked_rows if row.get("clinic_name", "")), "")
+    cluster_confidence = compute_cluster_confidence(cluster_ids, match_df)
+    name_conflict = len(unique_last_names) > 1
+    score = float(cluster_confidence["score"])
+    if name_conflict:
+        # Married-name changes are possible, but conflicts should reduce automatic certainty.
+        score = max(0.0, score - 0.10)
+    level = _score_to_level(score)
 
     golden = {
         "golden_id":      f"GR-{primary['id']}",
@@ -842,7 +861,7 @@ def build_golden_record(a: pd.Series, b: pd.Series) -> dict:
         "dob":            str(primary["dob"].date()) if pd.notna(primary["dob"]) else None,
         "license":        primary["license_n"],
         "specialty":      primary["specialty"],
-        "clinic_name":    primary.get("clinic_name", ""),
+        "clinic_name":    first_clinic,
         "address": {
             "street1":   primary.get("street1", ""),
             "street2":   primary.get("street2", ""),
@@ -851,25 +870,138 @@ def build_golden_record(a: pd.Series, b: pd.Series) -> dict:
             "postal":    primary["postal"],
             "phone":     primary.get("phone", ""),
         },
-        "other_practice_sites": merge_other_practice_sites(primary, secondary),
-        "source_ids":     [a["id"], b["id"]],
-        "name_conflict":  a["last_n"] != b["last_n"],  # flag married-name changes etc.
-        "confidence":     "HIGH" if trust_a >= 0.9 else "MEDIUM",
+        "other_practice_sites": merge_other_practice_sites(ranked_rows),
+        "source_ids":     [row["id"] for row in ranked_rows],
+        "name_conflict":  name_conflict,
+        "confidence":     level,
+        "confidence_score": round(score, 3),
+        "supporting_edges": int(cluster_confidence["supporting_edges"]),
+        "possible_edges": int(cluster_confidence["possible_edges"]),
     }
     return golden
 
-print("\n\nGOLDEN RECORDS")
-print("-" * 60)
-matches = feature_df[feature_df["decision"].str.startswith("AUTO-MATCH")]
-for _, row in matches.iterrows():
-    gr = build_golden_record(records_by_id.loc[row["id_a"]], records_by_id.loc[row["id_b"]])
-    print(f"\n  {gr['golden_id']}")
-    print(f"  Name      : {gr['first_name']} {gr['last_name']}")
-    print(f"  DOB       : {gr['dob']}  |  License: {gr['license']}")
-    print(f"  Specialty : {gr['specialty']}")
-    print(f"  Clinic    : {gr['clinic_name']}")
-    print(f"  Address   : {format_address(gr['address'])}")
-    print(f"  Phone     : {gr['address']['phone']}")
-    print(f"  Other sites: {gr['other_practice_sites']}")
-    print(f"  Sources   : {gr['source_ids']}")
-    print(f"  Conflicts : name_conflict={gr['name_conflict']}  confidence={gr['confidence']}")
+def main() -> None:
+    """Run the full provider identity resolution pipeline end-to-end."""
+    global feature_df, records_by_id
+
+    logger.handlers.clear()
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
+    reg_a = preprocess(registry_a)
+    reg_b = preprocess(registry_b)
+    reg_c = preprocess(registry_c)
+
+    # ─── Blocking + feature matrix ─────────────────────────────────────
+    pair_configs = [
+        ("A-B", reg_a, reg_b),
+        ("A-C", reg_a, reg_c),
+        ("B-C", reg_b, reg_c),
+    ]
+    feature_frames = []
+    for pair_name, left_df, right_df in pair_configs:
+        pairs = generate_candidate_pairs(left_df, right_df)
+        feature_frames.append(build_features(pairs, left_df, right_df, pair_name))
+        logger.info(f"{pair_name}: total pairs={len(left_df) * len(right_df)}  candidates={len(pairs)}")
+
+    feature_df = pd.concat(feature_frames, ignore_index=True)
+    logger.info("\nFeature matrix (candidate pairs x features):")
+    logger.info(feature_df.drop(columns=["idx_a", "idx_b"]).round(2).to_string() + "\n")
+
+    # ─── Labelled training data ─────────────────────────────────────────
+    feature_df["label"] = feature_df.apply(
+        lambda r: lookup_label(r["id_a"], r["id_b"]), axis=1
+    )
+    labelled = feature_df.dropna(subset=["label"])
+    logger.info(f"Labelled pairs: {len(labelled)}  (matches: {int(labelled['label'].sum())})\n")
+
+    X = labelled[FEATURE_COLS].values
+    y = labelled["label"].astype(int).values
+
+    # ─── Rule-based fast-path ───────────────────────────────────────────
+    feature_df["rule_decision"] = feature_df[FEATURE_COLS].apply(rule_based_decision, axis=1)
+
+    # ─── ML classifier (XGBoost) ───────────────────────────────────────
+    # With only 4 labelled pairs we skip train/test split (demo only).
+    # In production: hundreds/thousands of labelled pairs → proper split + cross-val.
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    clf = XGBClassifier(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=42,
+    )
+    clf.fit(X_scaled, y)
+
+    # ─── Predict on all candidate pairs ────────────────────────────────
+    X_all        = feature_df[FEATURE_COLS].values
+    X_all_scaled = scaler.transform(X_all)
+    proba        = clf.predict_proba(X_all_scaled)[:, 1]    # P(match)
+
+    feature_df["ml_prob"]  = proba
+    feature_df["decision"] = feature_df.apply(
+        lambda r: final_decision(r["rule_decision"], r["ml_prob"]), axis=1
+    )
+
+    # ─── 9. Results ────────────────────────────────────────────────────
+    logger.info("=" * 72)
+    logger.info("IDENTITY RESOLUTION RESULTS")
+    logger.info("=" * 72)
+
+    records_by_id = pd.concat(
+        [reg_a, reg_b, reg_c], ignore_index=True
+    ).set_index("id", drop=False)
+
+    for _, row in feature_df.iterrows():
+        a = records_by_id.loc[row["id_a"]]
+        b = records_by_id.loc[row["id_b"]]
+        logger.info(f"\n  {a['id']}  '{a['first']} {a['last']}'")
+        logger.info(f"  {b['id']}  '{b['first']} {b['last']}'")
+        logger.info(f"  Pair set: {row['pair_name']}")
+        logger.info(
+            f"  License match: {bool(row['lic_exact'])}  |  DOB exact: {bool(row['dob_exact'])}"
+            f"  |  Name JW: {row['jw_full']:.2f}"
+        )
+        logger.info(f"  -> {row['decision']}")
+
+    # ─── 10. Feature importance ─────────────────────────────────────────
+    logger.info("\n\nFEATURE IMPORTANCE (XGBoost gain)")
+    logger.info("-" * 40)
+    importances = pd.Series(clf.feature_importances_, index=FEATURE_COLS)
+    for feat, score in importances.sort_values(ascending=False).items():
+        bar = "#" * int(score * 40)
+        logger.info(f"  {feat:<20} {bar}  {score:.3f}")
+
+    # ─── 11. Golden records ─────────────────────────────────────────────
+    logger.info("\n\nGOLDEN RECORDS")
+    logger.info("-" * 60)
+    matches = feature_df[feature_df["decision"].str.startswith("AUTO-MATCH")]
+    clusters = build_match_clusters(matches)
+    clustered_ids = {pid for cluster in clusters for pid in cluster}
+    clusters += [[pid] for pid in records_by_id.index if pid not in clustered_ids]
+    for cluster in clusters:
+        cluster_rows = [records_by_id.loc[provider_id] for provider_id in cluster]
+        gr = build_golden_record(cluster_rows, cluster, matches)
+        logger.info(f"\n  {gr['golden_id']}")
+        logger.info(f"  Name      : {gr['first_name']} {gr['last_name']}")
+        logger.info(f"  DOB       : {gr['dob']}  |  License: {gr['license']}")
+        logger.info(f"  Specialty : {gr['specialty']}")
+        logger.info(f"  Clinic    : {gr['clinic_name']}")
+        logger.info(f"  Address   : {format_address(gr['address'])}")
+        logger.info(f"  Phone     : {gr['address']['phone']}")
+        logger.info(f"  Other sites: {gr['other_practice_sites']}")
+        logger.info(f"  Sources   : {gr['source_ids']}")
+        logger.info(
+            f"  Conflicts : name_conflict={gr['name_conflict']}  "
+            f"confidence={gr['confidence']} score={gr['confidence_score']:.3f} "
+            f"edges={gr['supporting_edges']}/{gr['possible_edges']}"
+        )
+
+
+if __name__ == "__main__":
+    main()
