@@ -115,7 +115,7 @@ if __name__ == "__main__":
   root.left.right.right.left = TreeNode(9)
   a = root.left.left.left
   b = root.left.right.right.left
-  TreeNode.print_tree(root)
+  print(root)
   print(TreeNode.lowest_common_ancestor(root, a, b).value)
   a = root.left.left.left
   b = root.right.right

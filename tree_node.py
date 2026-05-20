@@ -5,12 +5,7 @@ class TreeNode:
     self.right = right
 
   @staticmethod
-  def print_tree(root):
-    if root is None:
-      print("<empty>")
-      return
-
-    def build_display(node):
+  def build_display(node):
       text = str(node.value)
       text_width = len(text)
 
@@ -18,21 +13,21 @@ class TreeNode:
         return [text], text_width, text_width // 2
 
       if node.right is None:
-        left_lines, left_width, left_middle = build_display(node.left)
+        left_lines, left_width, left_middle = TreeNode.build_display(node.left)
         first_line = " " * (left_middle + 1) + "_" * (left_width - left_middle - 1) + text
         second_line = " " * left_middle + "/" + " " * (left_width - left_middle - 1 + text_width)
         shifted_left = [line + " " * text_width for line in left_lines]
         return [first_line, second_line] + shifted_left, left_width + text_width, left_width + text_width // 2
 
       if node.left is None:
-        right_lines, right_width, right_middle = build_display(node.right)
+        right_lines, right_width, right_middle = TreeNode.build_display(node.right)
         first_line = text + "_" * right_middle + " " * (right_width - right_middle)
         second_line = " " * (text_width + right_middle) + "\\" + " " * (right_width - right_middle - 1)
         shifted_right = [" " * text_width + line for line in right_lines]
         return [first_line, second_line] + shifted_right, text_width + right_width, text_width // 2
 
-      left_lines, left_width, left_middle = build_display(node.left)
-      right_lines, right_width, right_middle = build_display(node.right)
+      left_lines, left_width, left_middle = TreeNode.build_display(node.left)
+      right_lines, right_width, right_middle = TreeNode.build_display(node.right)
       first_line = (
         " " * (left_middle + 1)
         + "_" * (left_width - left_middle - 1)
@@ -54,7 +49,13 @@ class TreeNode:
       merged_lines = [left + " " * text_width + right for left, right in zip(left_lines, right_lines)]
       return [first_line, second_line] + merged_lines, left_width + text_width + right_width, left_width + text_width // 2
 
-    lines, _, _ = build_display(root)
+  @staticmethod
+  def print_tree(root):
+    if root is None:
+      print("<empty>")
+      return
+    
+    lines, _, _ = TreeNode.build_display(root)
     for line in lines:
       print(line.rstrip())
 
@@ -72,3 +73,7 @@ class TreeNode:
       return root
 
     return left if left else right
+  
+  def __str__(self) -> str:
+    lines, _, _ = TreeNode.build_display(self)
+    return "\n".join(lines)
