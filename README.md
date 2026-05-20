@@ -5,6 +5,9 @@ This workspace contains a comprehensive demo for cross-registry identity resolut
 Primary script:
 - [provider_identify_resolution_poc.py](provider_identify_resolution_poc.py)
 
+Additional utility:
+- [rate_limiter.py](rate_limiter.py)
+
 ## Purpose
 
 The script demonstrates how to reconcile provider identities across heterogeneous registry formats:
@@ -129,6 +132,32 @@ Registry pair sets evaluated:
 - B-C
 
 This reduces full cartesian comparisons while keeping likely matches.
+
+## FastAPI Rate Limiter Utility
+
+The workspace also includes a small in-memory rate limiter that can be plugged
+into a FastAPI route dependency.
+
+Example:
+
+```python
+from fastapi import Depends, FastAPI
+
+from rate_limiter import InMemoryRateLimiter
+
+app = FastAPI()
+limiter = InMemoryRateLimiter(limit=100, window_seconds=60)
+
+
+@app.get("/providers", dependencies=[Depends(limiter.as_dependency())])
+async def list_providers():
+  return {"ok": True}
+```
+
+Behavior:
+- fixed-window, in-memory counters keyed by client IP + method + path
+- `X-RateLimit-*` and `Retry-After` headers on allowed and rejected requests
+- raises HTTP 429 in FastAPI, or `RateLimitExceeded` when used without FastAPI
 
 ## Feature Engineering Details
 

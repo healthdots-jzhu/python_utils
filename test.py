@@ -2,7 +2,14 @@
 It is also a good place to test any new functions that are added to the main code before integrating them into the main codebase.
 """
 import re
+import sys
+
+from collections import Counter
+from datetime import datetime, timezone
+
 import pandas
+
+from tree_node import TreeNode
 
 def create_staircase(nums):
   step = 1
@@ -70,3 +77,46 @@ if __name__ == "__main__":
   _CLINIC_RE = re.compile(r"\b(?:" + "|".join(re.escape(clinic) for clinic in sorted(CLINICS, key=clinic_len_or_invalid, reverse=False)) + r")\.?\b", re.IGNORECASE)
   s = " Jason-clinic Center"
   print(_CLINIC_RE.findall(s))
+
+  def topKFrequent(nums, k):
+    print(datetime.now(timezone.utc).isoformat());
+    countDict = {}
+    for item in nums:
+      countDict[item] = countDict.get(item,0) + 1    
+    #sortedCounts = sorted(countDict, key=lambda x: countDict[x], reverse=True)
+    buckets = [[] for _ in range(len(nums) + 1)]
+    for n, c in countDict.items():
+        buckets[c].append(n)
+        
+    # 3. Iterate through buckets from highest frequency to lowest
+    result = []
+    for i in range(len(buckets) - 1, 0, -1):
+        for n in buckets[i]:
+            result.append(n)
+            if len(result) == k:
+                break
+
+    print(datetime.now(timezone.utc).isoformat());
+
+    return result
+
+  print(topKFrequent([1,1,456,3,2,57,4,5,2,7,8,9,9,9,9,1023,46,7,88899999,532,12,12,12,243,3512,23,2123,123,123,3,5,5,676,73,769,3,2,4,56,78,2,2,2,3,8,23,45,687,126,845,1,2,2,3], 5))
+
+  root = TreeNode(3)
+  root.left = TreeNode(5)
+  root.right = TreeNode(1)
+  root.left.left = TreeNode(6)
+  root.left.right = TreeNode(2)
+  root.right.left = TreeNode(0)
+  root.right.right = TreeNode(8)
+  root.left.right.left = TreeNode(7)
+  root.left.left.left = TreeNode(11)
+  root.left.right.right = TreeNode(4)
+  root.left.right.right.left = TreeNode(9)
+  a = root.left.left.left
+  b = root.left.right.right.left
+  TreeNode.print_tree(root)
+  print(TreeNode.lowest_common_ancestor(root, a, b).value)
+  a = root.left.left.left
+  b = root.right.right
+  print(TreeNode.lowest_common_ancestor(root, a, b).value)
