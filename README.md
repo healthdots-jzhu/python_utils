@@ -333,3 +333,61 @@ The E2E suite covers major variants:
 - unit/suite formatting differences
 - deterministic non-match guard under conflicting identity evidence
 - cross-registry matching across A-B, A-C, B-C
+
+# PDF Reader & Writer MCP Utility
+
+This workspace also includes a layout-aware PDF reader utility and a local MCP
+server so LLM clients can inspect PDFs without relying on plain-text extraction
+alone.
+
+The same MCP server also exposes a PDF writer utility for converting text,
+Markdown, XML, YAML, HTML, CSV, Excel, and Word documents into a generated PDF.
+
+Files:
+- `pdf_reader.py` - standalone utility for plain-text and layout-aware PDF extraction
+- `pdf_writer.py` - standalone utility for writing PDFs from text, markup, spreadsheet, and Word inputs
+- `pdf_mcp_server.py` - stdio MCP server exposing the reader as tools
+- `.vscode/mcp.json` - workspace MCP registration for GitHub Copilot in VS Code
+- `.mcp.json` - project-scoped registration for Claude Code
+
+Utility example:
+
+```powershell
+& .\.venv\Scripts\python.exe .\pdf_reader.py "C:\path\to\document.pdf" --pages 1 2 --max-chars 5000
+& .\.venv\Scripts\python.exe .\pdf_writer.py ".\notes.md" ".\notes.pdf"
+```
+
+The utility returns:
+- document metadata
+- bookmark or outline entries when present
+- plain text per page
+- layout-aware text per page
+- likely heading candidates
+- likely table blocks based on preserved spacing
+
+The writer utility returns:
+- source path and detected source type
+- output PDF path
+- generated PDF page count
+
+Writer dependencies:
+- `reportlab` for PDF generation
+- `beautifulsoup4` for robust HTML parsing
+- `openpyxl` for Excel input
+- `python-docx` for Word input
+
+GitHub Copilot in VS Code:
+- open Chat after trusting the server in `.vscode/mcp.json`
+- the `pdf-tools` MCP server exposes `inspect_pdf`, `inspect_pdf_page`, and `write_pdf_from_file`
+
+Claude Code:
+- the project already includes `.mcp.json`
+- or add it manually with:
+
+```bash
+claude mcp add --transport stdio pdf-tools -- ./.venv/Scripts/python.exe ./pdf_mcp_server.py
+```
+
+Other MCP clients, including Codex-compatible MCP setups:
+- point the client at the same stdio command and args used above
+- the server is standard MCP over stdio and does not depend on VS Code-specific APIs

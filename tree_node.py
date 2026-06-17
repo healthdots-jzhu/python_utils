@@ -77,3 +77,35 @@ class TreeNode:
   def __str__(self) -> str:
     lines, _, _ = TreeNode.build_display(self)
     return "\n".join(lines)
+  
+  @staticmethod
+  def find_node_by_value(root, value):
+    if (root.value == value):
+      return root
+
+    left = TreeNode.find_node_by_value(root.left, value) if root.left else None
+    if (left is not None):
+      return left
+
+    right = TreeNode.find_node_by_value(root.right, value) if root.right else None
+    if (right is not None):
+      return right
+
+    return None
+
+if __name__ == "__main__":
+  root = TreeNode(3)
+  root.left = TreeNode(5)
+  root.right = TreeNode(1)
+  root.left.left = TreeNode(6)
+  root.left.right = TreeNode(2)
+  root.right.left = TreeNode(0)
+  root.right.right = TreeNode(8)
+  root.left.right.left = TreeNode(7)
+  root.left.left.left = TreeNode(11)
+  root.left.right.right = TreeNode(4)
+  root.left.right.right.left = TreeNode(9)
+  a = root.left.left.left
+  b = TreeNode.find_node_by_value(root, 9)
+  print(root)
+  print(TreeNode.lowest_common_ancestor(root, a, b).value)

@@ -59,6 +59,12 @@ At a high level, the pipeline has three phases: **Normalize** (stages 1–2), **
 
 `detect_file_ext.py` is an independent standalone utility (not part of the pipeline).
 
+## Prompt Validation
+
+This workspace also includes a `prompt-tools` MCP server with a `validate_user_prompt` tool.
+
+Use it when the user asks to validate, review, score, or improve a prompt before sending it to a model. If the validator reports `ready_for_model = false`, summarize the blocking issues first and use the suggested rewrite or follow-up questions to tighten the prompt.
+
 ## Key Conventions
 
 **Normalized column naming:** All derived/normalized columns use a `_n` suffix (`first_n`, `last_n`, `license_n`, `postal_n`, etc.). Raw columns retain their original names. Feature columns are listed in the module-level `FEATURE_COLS` constant.

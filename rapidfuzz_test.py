@@ -19,7 +19,7 @@ def test_process():
 if __name__ == "__main__":
     test_fuzz()
     test_process()
-    rng = np.random.default_rng(seed=42)
+    rng = np.random.default_rng()
     print(f"Random ratios: {rng.random(5)}")
     print(f"Random integers: {rng.integers(low=12, high=46, size=5)}")
     print("All tests passed!")

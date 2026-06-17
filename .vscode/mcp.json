@@ -1,0 +1,20 @@
+{
+  "servers": {
+    "prompt-tools": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/prompt_mcp_server.py"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    "pdf-tools": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/pdf_mcp_server.py"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
